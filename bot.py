@@ -73,8 +73,8 @@ SOURCES = {
     "EURUSD": [("yahoo", "EURUSD=X")],
     "GBPUSD": [("yahoo", "GBPUSD=X")],
 }
-MIN_POLL_INTERVAL = {"td": 9.0}      # Twelve Data رایگان: ۸ درخواست در دقیقه
-TD_DAILY_BUDGET = 700                # سقف ۸۰۰ در روز؛ بعد از این فاصله‌ی چک بیشتر می‌شود
+MIN_POLL_INTERVAL = {"td": 15.0}     # Twelve Data رایگان: ۸/دقیقه و ۸۰۰/روز → هر ۱۵ ثانیه ≈ ۷۲۰ در بازه‌ی ۳ ساعته
+TD_DAILY_BUDGET = 760                # سقف ۸۰۰ در روز؛ بعد از این فاصله‌ی چک بیشتر می‌شود
 SANE_RANGE["GLD"] = (30, 1000)
 def expects_live(code, ts):
     """شاخص‌های cash (با ^) فقط ۰۹:۳۰–۱۶:۰۰ نیویورک داده‌ی زنده دارند."""
@@ -1263,6 +1263,8 @@ class Runner:
             L.append(f"• {s}: {esc(self.feeds[s].label)}")
         if any(self.feeds[s].sources[self.feeds[s].src_i][1].startswith("^") for s in SYMBOLS):
             L.append("ℹ️ شاخص‌ها (NAS100/US30/SPX500) از ۰۹:۳۰ نیویورک داده دارند؛ قبل از آن سیگنال شاخص‌ها ممکن نیست.")
+        if any(self.feeds[s].sources[self.feeds[s].src_i][0] == "td" for s in SYMBOLS):
+            L.append("ℹ️ طلا از Twelve Data است: کندل حدود ۳۰ ثانیه بعد از کلوز در داده می‌آید (پیام ناحیه‌ی طلا کمی دیرتر می‌رسد).")
         if any(self.feeds[s].sources[self.feeds[s].src_i][1] == "GLD" for s in SYMBOLS):
             L.append("⚠️ طلا فعلاً با ETF طلا (GLD) است؛ قیمت‌ها با XAUUSD فرق مقیاس دارند.")
         if late:
