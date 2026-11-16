@@ -26,7 +26,8 @@ SHORT = {"NAS100": "NAS", "US30": "US30", "SPX500": "SPX",
          "XAUUSD": "XAU", "EURUSD": "EUR", "GBPUSD": "GBP"}
 DIGITS = {"NAS100": 2, "US30": 2, "SPX500": 2, "XAUUSD": 2, "EURUSD": 5, "GBPUSD": 5}
 SANE_RANGE = {"NAS100": (3000, 80000), "US30": (8000, 100000), "SPX500": (1500, 20000),
-              "XAUUSD": (500, 20000), "EURUSD": (0.4, 3.0), "GBPUSD": (0.4, 3.5)}
+              "XAUUSD": (500, 20000), "EURUSD": (0.4, 3.0), "GBPUSD": (0.4, 3.5),
+              "RAW": (0.0001, 1e9)}      # RAW فقط برای probe (ETFها)
 
 WINDOW_START = (8, 30)        # ساعت نیویورک
 WINDOW_END = (11, 30)
@@ -71,6 +72,15 @@ if os.environ.get("PRIMARY_SOURCE", "yahoo") == "duka":     # اگر probe نش�
     for _s in SOURCES:
         SOURCES[_s].sort(key=lambda x: 0 if x[0] == "duka" else 1)
 
+# کدهای اضافه که فقط probe امتحان می‌کند (برای پیدا کردن منبع بی‌تأخیر برای شاخص‌ها و طلا)
+PROBE_EXTRA = {
+    "NAS100": ["^NDX", "QQQ"],
+    "US30": ["^DJI", "DIA"],
+    "SPX500": ["^GSPC", "SPY"],
+    "XAUUSD": ["XAU=X", "GLD", "IAU"],
+}
+RAW_CODES = {"QQQ", "DIA", "SPY", "GLD", "IAU"}
+MAX_DATA_AGE_SEC = 240        # منبعی که آخرین کندلش از این قدیمی‌تر باشد (مثلاً تأخیر ۱۰ دقیقه‌ای Yahoo) سالم حساب نمی‌شود
 RLM = "\u200f"
 STATE_BRANCH = "bot-state"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -559,7 +569,7 @@ class Feed:
     def healthy(self, now):
         if len(self.cands) < 100:
             return False
-        return now - max(self.cands) <= 900
+        return now - max(self.cands) <= MAX_DATA_AGE_SEC
 
     def start(self, now):
         """از اولین منبع سالم شروع کن؛ اگر هیچ‌کدام سالم نبود بهترین موجود را نگه دار."""
@@ -1340,6 +1350,8 @@ def cmd_probe(seconds=180, send=True):
     seconds = int(seconds)
     log(f"probe شروع شد؛ {seconds} ثانیه نمونه‌برداری زنده…")
     targets = [(s, k, code) for s in SYMBOLS for (k, code) in SOURCES[s]]
+    targets += [(s, "yahoo", code) for s in SYMBOLS for code in PROBE_EXTRA.get(s, [])
+                if ("yahoo", code) not in SOURCES[s]]
     res = {tg: {"rtt": [], "age": [], "first": [], "err": {}, "hist": None, "age_nc": [], "n": 0}
            for tg in targets}
 
@@ -1348,7 +1360,7 @@ def cmd_probe(seconds=180, send=True):
         r = res[tg]
         t0 = time.time()
         try:
-            cands, meta = PROVIDERS[k].fetch(s, code, now=time.time(), full=True)
+            cands, meta = PROVIDERS[k].fetch("RAW" if code in RAW_CODES else s, code, now=time.time(), full=True)
             r["hist"] = {"sec": time.time() - t0, "n": len(cands),
                          "last_age": time.time() - cands[-1][0] if cands else None,
                          "price": cands[-1][4] if cands else None}
@@ -1369,7 +1381,7 @@ def cmd_probe(seconds=180, send=True):
             bust = (i % 2 == 0)
             i += 1
             try:
-                cands, meta = PROVIDERS[k].fetch(s, code, start=now - 400, end=now + 300, now=now, cache_bust=bust)
+                cands, meta = PROVIDERS[k].fetch("RAW" if code in RAW_CODES else s, code, start=now - 400, end=now + 300, now=now, cache_bust=bust)
                 r["rtt"].append(meta.get("rtt", 0))
                 r["n"] += 1
                 lt = meta.get("last_trade_ts")
