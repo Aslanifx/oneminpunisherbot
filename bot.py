@@ -60,25 +60,35 @@ HTTP_TIMEOUT = 8
 
 # ── منابع داده (به ترتیب اولویت: اصلی ← پشتیبان) ──
 # yahoo: فیوچرز/اسپات Yahoo Finance ؛ duka: Dukascopy (CFD/اسپات واقعی، بدون حساب)
+# نتیجه‌ی probe واقعی (۱۴:۵۰ نیویورک): فیوچرز Yahoo ≈ ۱۰ دقیقه تأخیر دارد ← غیرقابل استفاده.
+# شاخص‌های cash (^NDX ^DJI ^GSPC) زنده‌اند (تأخیر ~۲ ثانیه) ولی فقط از ۰۹:۳۰ تا ۱۶:۰۰ نیویورک داده دارند.
+# EURUSD/GBPUSD در Yahoo اسپات و زنده‌اند. XAUUSD=X در Yahoo وجود ندارد.
+# طلا: اگر کلید رایگان Twelve Data بگذارید اسپات واقعی XAU/USD ؛ وگرنه ETF طلا (GLD) با مقیاس قیمت متفاوت.
+TD_KEY = (os.environ.get("TD_API_KEY") or "").strip()
 SOURCES = {
-    "NAS100": [("yahoo", "NQ=F"), ("duka", "USATECHIDXUSD")],
-    "US30":   [("yahoo", "YM=F"), ("duka", "USA30IDXUSD")],
-    "SPX500": [("yahoo", "ES=F"), ("duka", "USA500IDXUSD")],
-    "XAUUSD": [("yahoo", "XAUUSD=X"), ("yahoo", "GC=F"), ("duka", "XAUUSD")],
-    "EURUSD": [("yahoo", "EURUSD=X"), ("duka", "EURUSD")],
-    "GBPUSD": [("yahoo", "GBPUSD=X"), ("duka", "GBPUSD")],
+    "NAS100": [("yahoo", "^NDX")],
+    "US30":   [("yahoo", "^DJI")],
+    "SPX500": [("yahoo", "^GSPC")],
+    "XAUUSD": [("td", "XAU/USD")] if TD_KEY else [("yahoo", "GLD")],
+    "EURUSD": [("yahoo", "EURUSD=X")],
+    "GBPUSD": [("yahoo", "GBPUSD=X")],
 }
-if os.environ.get("PRIMARY_SOURCE", "yahoo") == "duka":     # اگر probe نشان داد Dukascopy بهتر است
-    for _s in SOURCES:
-        SOURCES[_s].sort(key=lambda x: 0 if x[0] == "duka" else 1)
+MIN_POLL_INTERVAL = {"td": 9.0}      # Twelve Data رایگان: ۸ درخواست در دقیقه
+TD_DAILY_BUDGET = 700                # سقف ۸۰۰ در روز؛ بعد از این فاصله‌ی چک بیشتر می‌شود
+SANE_RANGE["GLD"] = (30, 1000)
+def expects_live(code, ts):
+    """شاخص‌های cash (با ^) فقط ۰۹:۳۰–۱۶:۰۰ نیویورک داده‌ی زنده دارند."""
+    if not code.startswith("^"):
+        return True
+    d = datetime.fromtimestamp(ts, TZ_NY)
+    if d.weekday() >= 5:
+        return False
+    m = d.hour * 60 + d.minute
+    return 9 * 60 + 30 <= m < 16 * 60
+
 
 # کدهای اضافه که فقط probe امتحان می‌کند (برای پیدا کردن منبع بی‌تأخیر برای شاخص‌ها و طلا)
-PROBE_EXTRA = {
-    "NAS100": ["^NDX", "QQQ"],
-    "US30": ["^DJI", "DIA"],
-    "SPX500": ["^GSPC", "SPY"],
-    "XAUUSD": ["XAU=X", "GLD", "IAU"],
-}
+PROBE_EXTRA = {}
 RAW_CODES = {"QQQ", "DIA", "SPY", "GLD", "IAU"}
 MAX_DATA_AGE_SEC = 240        # منبعی که آخرین کندلش از این قدیمی‌تر باشد (مثلاً تأخیر ۱۰ دقیقه‌ای Yahoo) سالم حساب نمی‌شود
 RLM = "\u200f"
@@ -503,7 +513,70 @@ class Duka:
         return res, meta
 
 
-PROVIDERS = {"yahoo": Yahoo(), "duka": Duka()}
+class TwelveData:
+    """Twelve Data (کلید رایگان). فقط برای طلا (XAU/USD). آخرین ردیف = کندل در حال تشکیل. محدودیت رایگان: ۸ درخواست/دقیقه، ۸۰۰/روز."""
+    URL = "https://api.twelvedata.com/time_series"
+
+    def __init__(self):
+        self.calls_today = 0
+        self.day = None
+
+    @staticmethod
+    def parse(sym, js):
+        if js.get("status") == "error" or "values" not in js:
+            code = js.get("code")
+            raise ProviderError(f"twelvedata: {str(js.get('message'))[:120]}", 429 if code == 429 else code)
+        out = []
+        for v in js["values"]:
+            try:
+                t = int(datetime.strptime(v["datetime"][:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=_dt.timezone.utc).timestamp())
+                c = sane_candle(sym, float(v["open"]), float(v["high"]), float(v["low"]), float(v["close"]))
+            except (KeyError, ValueError):
+                continue
+            if c:
+                out.append((t,) + c)
+        out.sort()
+        return out
+
+    def _get(self, params):
+        params = dict(params, apikey=TD_KEY, interval="1min", timezone="UTC", format="JSON", order="DESC")
+        try:
+            r = http().get(self.URL, params=params, timeout=HTTP_TIMEOUT)
+            js = r.json()
+        except (requests.RequestException, ValueError) as e:
+            raise ProviderError(f"twelvedata net: {e}")
+        d = datetime.now(_dt.timezone.utc).date()
+        if d != self.day:
+            self.day, self.calls_today = d, 0
+        self.calls_today += 1
+        return js
+
+    def fetch(self, sym, code, start=None, end=None, now=None, full=False, cache_bust=True):
+        if not TD_KEY:
+            raise ProviderError("TD_API_KEY تنظیم نشده")
+        t0 = time.time()
+        if full or start is None:
+            out = {}
+            end_date = None
+            for _ in range(2):                         # ۲ صفحه × ۵۰۰۰ کندل ≈ ۷ روز
+                p = {"symbol": code, "outputsize": 5000}
+                if end_date:
+                    p["end_date"] = end_date
+                rows = self.parse(sym, self._get(p))
+                if not rows:
+                    break
+                for r in rows:
+                    out[r[0]] = r
+                end_date = datetime.fromtimestamp(rows[0][0] - 60, _dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            res = [out[k] for k in sorted(out)]
+        else:
+            res = self.parse(sym, self._get({"symbol": code, "outputsize": 6}))
+        meta = {"last_trade_ts": res[-1][0] if res else None, "price": res[-1][4] if res else None,
+                "rtt": time.time() - t0}
+        return res, meta
+
+
+PROVIDERS = {"yahoo": Yahoo(), "duka": Duka(), "td": TwelveData()}
 
 
 class Snapshot:
@@ -532,18 +605,28 @@ class Feed:
         self.next_hb = 0.0
         self.first_seen = {}      # t -> زمان دیده‌شدن اولین‌بار (برای اندازه‌گیری تأخیر)
         self.source_changed = None
+        self.next_allowed = 0.0
 
     @property
     def label(self):
         kind, code = self.sources[self.src_i]
         if kind == "yahoo":
-            note = "فیوچرز" if code.endswith("=F") else "اسپات"
+            if code.endswith("=F"):
+                note = "فیوچرز"
+            elif code.startswith("^"):
+                note = "شاخص cash"
+            elif code == "GLD":
+                note = "ETF طلا؛ مقیاس قیمت ≠ XAUUSD"
+            else:
+                note = "اسپات"
             return f"Yahoo Finance {code} ({note})"
+        if kind == "td":
+            return f"Twelve Data {code} (اسپات)"
         return f"Dukascopy {code} (CFD/اسپات)"
 
     def _call(self, now, **kw):
         kind, code = self.sources[self.src_i]
-        return self.providers[kind].fetch(self.sym, code, now=now, **kw)
+        return self.providers[kind].fetch("GLD" if code == "GLD" else self.sym, code, now=now, **kw)
 
     def _merge(self, cands, now):
         with self.lock:
@@ -569,6 +652,8 @@ class Feed:
     def healthy(self, now):
         if len(self.cands) < 100:
             return False
+        if not expects_live(self.sources[self.src_i][1], now):
+            return True                      # شاخص cash خارج از ساعت خودش: تازه‌نبودن طبیعی است
         return now - max(self.cands) <= MAX_DATA_AGE_SEC
 
     def start(self, now):
@@ -603,7 +688,7 @@ class Feed:
             self.cur_b = b
             self.got_b = False
             self.next_bpoll = b + BOUNDARY_FIRST_DELAY + random.random() * 0.4
-        if now < self.backoff_until:
+        if now < self.backoff_until or now < self.next_allowed:
             return False
         if not self.got_b and self.next_bpoll <= now < b + BOUNDARY_GIVEUP:
             return True
@@ -614,6 +699,11 @@ class Feed:
     def poll(self, now):
         """یک بار دریافت کندل‌های جدید. True = موفق."""
         self.next_hb = now + HEARTBEAT_POLL_SEC
+        kind = self.sources[self.src_i][0]
+        gap = MIN_POLL_INTERVAL.get(kind, 0)
+        if kind == "td" and PROVIDERS["td"].calls_today > TD_DAILY_BUDGET:
+            gap = 30.0
+        self.next_allowed = now + gap
         if self.cands:
             start = max(self.cands) - 600
         else:
@@ -1171,6 +1261,10 @@ class Runner:
              "⏱ تایم‌فریم: ۱ دقیقه | نمادها: " + "، ".join(SYMBOLS)]
         for s in SYMBOLS:
             L.append(f"• {s}: {esc(self.feeds[s].label)}")
+        if any(self.feeds[s].sources[self.feeds[s].src_i][1].startswith("^") for s in SYMBOLS):
+            L.append("ℹ️ شاخص‌ها (NAS100/US30/SPX500) از ۰۹:۳۰ نیویورک داده دارند؛ قبل از آن سیگنال شاخص‌ها ممکن نیست.")
+        if any(self.feeds[s].sources[self.feeds[s].src_i][1] == "GLD" for s in SYMBOLS):
+            L.append("⚠️ طلا فعلاً با ETF طلا (GLD) است؛ قیمت‌ها با XAUUSD فرق مقیاس دارند.")
         if late:
             L.append("⚠️ ربات بعد از شروع بازه روشن شد؛ کندل‌های گذشته‌ی بازه هم بررسی شدند.")
         L.append("برای وضعیت لحظه‌ای بنویسید: /status")
@@ -1216,7 +1310,7 @@ class Runner:
                 elif w.alerted_out and gap < 30:
                     w.alerted_out = False
                     self.notify(rtl([f"✅ داده‌ی {w.sym} دوباره وصل شد."]), silent=True)
-                if f.cands and now < self.we:
+                if f.cands and now < self.we and expects_live(f.sources[f.src_i][1], now):
                     age = now - max(f.cands)
                     if age > STALE_CANDLE_SEC and not w.alerted_stale:
                         w.alerted_stale = True
@@ -1397,7 +1491,7 @@ def cmd_probe(seconds=180, send=True):
                 r["err"][key] = r["err"].get(key, 0) + 1
             except Exception as e:      # noqa
                 r["err"]["x"] = r["err"].get("x", 0) + 1
-            time.sleep(2.0 + random.random() * 0.5)
+            time.sleep((10.0 if k == "td" else 2.0) + random.random() * 0.5)
 
     ths = [threading.Thread(target=hist, args=(tg,)) for tg in targets]
     [t.start() for t in ths]
@@ -1713,6 +1807,19 @@ def selftest(out_dir=None):
     fixed, d = dk._fix_scale("XAUUSD", "XAUUSD", [(1, 4100000.0, 4100000.0, 4100000.0, 4100000.0)], 1000)
     check(abs(fixed[0][4] - 4100.0) < 1e-6, "اصلاح خودکار مقیاس قیمت Dukascopy")
 
+    tdjs = {"values": [{"datetime": "2026-11-16 13:31:00", "open": "4121.5", "high": "4122.5", "low": "4121.0", "close": "4122.0"},
+                       {"datetime": "2026-11-16 13:30:00", "open": "4120.0", "high": "4121.8", "low": "4119.9", "close": "4121.5"}]}
+    cs = TwelveData.parse("XAUUSD", tdjs)
+    check(len(cs) == 2 and cs[0][0] < cs[1][0] and cs[0][4] == 4121.5 and cs[0][0] == int(datetime(2026, 11, 16, 13, 30, tzinfo=_dt.timezone.utc).timestamp()),
+          "Twelve Data parse (UTC ، مرتب‌سازی)")
+    try:
+        TwelveData.parse("XAUUSD", {"status": "error", "code": 429, "message": "limit"})
+        check(False, "خطای ۴۲۹ Twelve Data باید ProviderError بدهد")
+    except ProviderError as e:
+        check(e.status == 429, "خطای ۴۲۹ Twelve Data")
+    check(expects_live("^NDX", u(2026, 11, 16, 14, 29)) is False and expects_live("^NDX", u(2026, 11, 16, 14, 30)) is True
+          and expects_live("^NDX", u(2026, 11, 16, 21, 0)) is False and expects_live("EURUSD=X", u(2026, 11, 16, 14, 0)) is True,
+          "ساعت زنده‌ی شاخص cash: ۰۹:۳۰–۱۶:۰۰ نیویورک")
     print("▶ تست ۸: بسته‌بودن کندل (فقط کندل بسته‌شده)")
     f = Feed("XAUUSD", providers={}, sources=[("yahoo", "X")])
     base = 1_800_000_000 - (1_800_000_000 % 60)
